@@ -1,0 +1,855 @@
+---
+title: "Code to Generate Supplementary Figure 4"
+author: "Christopher Holt"
+date: "23-May-2024"
+output: pdf_document
+---
+
+# Load Libraries
+
+```{r Load in libraries}
+library(edgeR)
+library(FactoMineR)
+library(ggdendro)
+library(tidyverse)
+library(pvclust)
+library(variancePartition)
+library(WGCNA)
+library(devtools)
+devtools::source_url("https://raw.githubusercontent.com/obigriffith/biostar-tutorials/master/Heatmaps/heatmap.3.R")
+```
+
+# Session Info
+
+```{r print session info}
+sessionInfo()
+```
+
+# Load in Functions
+
+```{r load functions}
+## Add mitochondrial gene information to GENEINFO
+add_mitochondrial_genes <- function(df, column_name){
+  df <- df %>% mutate("{column_name}" := ifelse(grepl('gene11440', df[[column_name]]), 'gene-nad2',
+                                                ifelse(grepl('gene11441', df[[column_name]]), 'gene-nad4',
+                                                       ifelse(grepl('gene11442', df[[column_name]]), 'gene-cox1',
+                                                              ifelse(grepl('gene11443', df[[column_name]]), 'gene-nad6',
+                                                                     ifelse(grepl('gene11444', df[[column_name]]), 'gene-cob',
+                                                                            ifelse(grepl('gene11445', df[[column_name]]), 'gene-cox3',
+                                                                                   ifelse(grepl('gene11446', df[[column_name]]), 'gene-nad4L',
+                                                                                          ifelse(grepl('gene11447', df[[column_name]]), 'gene-nad1',
+                                                                                                 ifelse(grepl('gene11448', df[[column_name]]), 'gene-atp6',
+                                                                                                        ifelse(grepl('gene11449', df[[column_name]]), 'gene-cox2',
+                                                                                                               ifelse(grepl('gene11450', df[[column_name]]), 'gene-nad3',
+                                                                                                                      ifelse(grepl('gene11451', df[[column_name]]), 'gene-nad5', df[[column_name]])))))))))))))
+
+
+  return(df)
+
+}
+
+create_matrix <- function(df, row, centre, column){
+  df <- as.data.frame(df)
+  test <- df %>% select(all_of(row), all_of(centre), all_of(column))
+  replicates.test <- unique(test[[column]])
+  tmp.matrix <- tibble(gene=unique(df[[row]])) ## row
+  for (replicate_uniq in replicates.test){
+    tmp <- test %>% filter(!!as.symbol(column) == replicate_uniq)
+    colnames(tmp)[2] <- replicate_uniq
+    tmp[[column]] <- NULL
+    tmp.matrix <- inner_join(tmp.matrix, tmp, by = c('gene' = row))
+  }
+
+  tmp.matrix <- tmp.matrix %>% tibble::column_to_rownames('gene')
+  return(tmp.matrix)
+
+}
+
+
+calculate_TPM <- function(counts.mat, counts.orig){
+  gene_length <- counts.orig %>% select('Name', 'length') %>% unique
+  for (i in 1:ncol(counts.mat)){
+    counts.mat[,i] <- counts.mat[,i]/gene_length[,2]
+    counts.mat[,i] <- counts.mat[,i]/(sum(counts.mat[,i])/1000000)
+  }
+
+  return(counts.mat)
+}
+
+find_soft_power <- function(sft){
+  df <- as.data.frame(cbind(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2]))
+  y <- -sign(sft$fitIndices[,3])*sft$fitIndices[,2]
+  dy <- diff(y) 
+  softpower <- which(abs(diff(y)) < 0.05)[1]
+  return(softpower)
+}
+
+eigengene_invert_id <- function(tpm.de.wgcna, mergedColors, mergedMEs){
+  tpm.de <- tpm.de.wgcna
+  tpm.de.wgcna$invert <- T
+  tpm.de.wgcna$module <- mergedColors
+  for(i in 1:nrow(tpm.de.wgcna)){
+    if(cor(t(tpm.de[i,]), mergedMEs[,which(colnames(mergedMEs) == paste0("ME",tpm.de.wgcna$module[i]))], method = "pearson") >= 0){
+      tpm.de.wgcna$invert[i] <- F
+    }
+  }
+  return(tpm.de.wgcna)
+}
+
+wgcna_heatmap_reorder <- function(tpm.de.wgcna){
+  clusters <- as.data.frame(table(tpm.de.wgcna$module))
+  clusters <- clusters[order(-clusters[,2]),1]
+
+  tpm.de.wgcna.reordered <- as.data.frame(matrix(nrow = 0,
+                                                 ncol = ncol(tpm.de.wgcna)))
+  for(i in 1:length(clusters)){
+    tpm.de.wgcna.reordered <- as.data.frame(rbind(tpm.de.wgcna.reordered,
+                                                  tpm.de.wgcna[tpm.de.wgcna$module == clusters[i] & tpm.de.wgcna$invert == F,],
+                                                  tpm.de.wgcna[tpm.de.wgcna$module == clusters[i] & tpm.de.wgcna$invert == T,]))
+  }
+  return(tpm.de.wgcna.reordered)
+}
+
+get_heatmap_separators <- function(vector){
+  sep <- c()
+  for(i in 2:length(unique(vector))){
+    sep[length(sep) + 1] <- min(which(vector == unique(vector)[i])) - 1
+  }
+  return(sep)
+}
+
+
+eigengene_refit <- function(tpm.de, mergedMEs, min_pearson_corr = 0.8){
+  tpm.de.wgcna <- tpm.de
+  tpm.de.wgcna$invert <- T
+  tpm.de.wgcna$module <- NA
+  for(i in 1:nrow(tpm.de)){
+    minimum_correlation <- min_pearson_corr
+    for(j in 1:ncol(mergedMEs)){
+      cor <- abs(cor(t(tpm.de[i,]), mergedMEs[,j], method = "pearson"))
+      if(cor > minimum_correlation){
+        minimum_correlation <- cor
+        tpm.de.wgcna$module[i] <- colnames(mergedMEs)[j]
+      }
+    }
+    if(!is.na(tpm.de.wgcna$module[i])){
+      if(cor(t(tpm.de[i,]), mergedMEs[,which(colnames(mergedMEs) == tpm.de.wgcna$module[i])], method = "pearson") > 0){
+        tpm.de.wgcna$invert[i] <- F
+      }
+    }else{
+      tpm.de.wgcna$invert[i] <- NA
+    }
+
+  }
+  tpm.de.wgcna$module <- gsub("^ME","",tpm.de.wgcna$module)
+  return(tpm.de.wgcna)
+}
+
+consolidate_functional_terms <- function(geneinfo){
+
+  ipr <- as.data.frame(unlist(strsplit(paste(geneinfo$interpro_description, collapse = "|"),  split = "[|]")))
+  gobio <- as.data.frame(unlist(strsplit(paste(geneinfo$go_biologicalprocess, collapse = "|"),  split = "[|]")))
+  gocell <- as.data.frame(unlist(strsplit(paste(geneinfo$go_cellularcomponent, collapse = "|"),  split = "[|]")))
+  gomol <- as.data.frame(unlist(strsplit(paste(geneinfo$go_molecularfunction, collapse = "|"),  split = "[|]")))
+
+  ipr <- as.data.frame(table(ipr))
+  gobio <- as.data.frame(table(gobio))
+  gocell <- as.data.frame(table(gocell))
+  gomol <- as.data.frame(table(gomol))
+
+  functionalterms.list <- list(ipr = ipr, gobio = gobio, gocell = gocell, gomol = gomol)
+
+  return(functionalterms.list)
+}
+
+
+functionaltermenrichment <- function(genes, geneinfo, functionalterms.list){
+
+  geneinfo.subset <- geneinfo[geneinfo$gene %in% genes,]
+  term <- c()
+  clusteroccurences <- c()
+  genomeoccurences <- c()
+  pvalue <- c()
+  correctedpvalue <- c()
+  oddsratio <- c()
+  clusterProportion <- c()
+  genomeProportion <- c()
+  clusterSize <- c()
+  genomeSize <- c()
+  newOddsRatio <- c()
+
+  functionalterms.list.subset <- consolidate_functional_terms(geneinfo.subset)
+
+  for(i in 1:length(functionalterms.list)){
+    for(j in 1:nrow(functionalterms.list[[i]])){
+
+      freq.all <- functionalterms.list[[i]][j,2] ## How amany times the IPR/GO term appears in the entire geneinfo file
+
+      ## determine if the functional term is in the subset
+      ## If it isn't, then the frequency is set to 0
+      ## If it is in the subset, then extract the frequency of the IPR/GO term from within the subset
+      freq.subset <- ifelse(functionalterms.list[[i]][j,1] %in% functionalterms.list.subset[[i]][,1],
+                            functionalterms.list.subset[[i]][functionalterms.list.subset[[i]][,1] == as.character(functionalterms.list[[i]][j,1]),2],
+                            0)
+
+      ## Number of genes in the whole genome
+      genes.all <- nrow(geneinfo)
+
+      ## Number of genes in the cluster
+      genes.subset <- nrow(geneinfo.subset)
+      # [col.row]
+      ## [1,1] is frequency is the subset, [1,2] is remaining frequency in rest of gene term file (col 1 total is total frequency of term in genome)
+      ## [2,1] is no. genes that do not have this term in the subset, [2,2] is no. genes that do not have this term in genome (minus genes in subset)
+      fisherexact.matrix <- matrix(c(freq.subset, freq.all - freq.subset,
+                                     genes.subset - freq.subset, genes.all - genes.subset - freq.all + freq.subset),
+                                   nrow = 2,
+                                   ncol = 2)
+      fisher.test <- fisher.test(fisherexact.matrix)
+
+      term[length(term) + 1] <- as.character(functionalterms.list[[i]][j,1])
+      clusteroccurences[length(clusteroccurences) + 1] <- as.numeric(as.character(freq.subset))
+      genomeoccurences[length(genomeoccurences) + 1] <- as.numeric(as.character(freq.all))
+      pvalue[length(pvalue) + 1] <- as.numeric(as.character(fisher.test$p.value))
+      correctedpvalue[length(correctedpvalue) + 1] <- p.adjust(as.numeric(as.character(fisher.test$p.value)), method = "fdr", n = nrow(functionalterms.list[[i]]))
+      oddsratio[length(oddsratio) + 1] <- as.numeric(as.character(fisher.test$estimate)) ## if < 1, term is under represented in the cluster
+
+      clusterProportion[length(clusterProportion) + 1] <- as.numeric(fisherexact.matrix[1,1]/fisherexact.matrix[2,1])
+      clusterSize[length(clusterSize) + 1] <- as.numeric(fisherexact.matrix[2,1])
+      genomeProportion[length(genomeProportion) + 1] <- as.numeric(fisherexact.matrix[1,2]/fisherexact.matrix[2,2])
+      genomeSize[length(genomeSize) + 1] <- as.numeric(fisherexact.matrix[2,2])
+
+      newOddsRatio[length(newOddsRatio) + 1] <- as.numeric((fisherexact.matrix[1,1]/fisherexact.matrix[2,1])/(fisherexact.matrix[1,2]/fisherexact.matrix[2,2]))
+
+    }
+  }
+
+  terms.df <- as.data.frame(cbind(term,
+                                  clusteroccurences,
+                                  genomeoccurences,
+                                  pvalue,
+                                  correctedpvalue,
+                                  oddsratio,
+                                  clusterProportion,
+                                  clusterSize,
+                                  genomeProportion,
+                                  genomeSize,
+                                  newOddsRatio))
+  terms.df <- terms.df[order(as.numeric(as.character(terms.df$pvalue))),]
+  return(terms.df)
+}
+  
+ggplot_legend <- function(a.gplot){ 
+  tmp <- ggplot_gtable(ggplot_build(a.gplot)) 
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box") 
+  legend <- tmp$grobs[[leg]] 
+  return(legend)
+
+}
+tidy_matrix <- function(df){
+  tidy_df <- tibble()
+  cols <- colnames(df %>% select(-'invert', -'module'))
+  for(col in cols){
+    tmp <- df %>% select(col)
+    colnames(tmp)[1] <- 'z_score'
+    tmp$replicate <- col
+    tmp <- tmp %>% rownames_to_column('gene')
+    tmp <- tmp %>% select('gene', 'replicate', 'z_score')
+    tidy_df <- rbind(tidy_df, tmp)
+  }
+  
+  tidy_df <- inner_join(tidy_df,
+                        df %>%
+                          rownames_to_column('gene') %>%
+                          select('gene', 'invert', 'module'),
+                        by = 'gene')
+  
+  return(tidy_df)
+}
+
+
+
+factor_groups <- function(GROUPS){
+  
+  for (col in colnames(GROUPS)){
+    GROUPS[[col]] = factor(GROUPS[[col]], levels = unique(GROUPS[[col]]))
+  }
+  
+  return(GROUPS)
+}
+
+downsample_groups <- function(df, i, row_num){
+  sample_list <- sample(df$Sample, i)
+  df.new <- df %>% filter(Sample %in% sample_list)
+  while(nrow(df.new) != row_num){
+    sample_list <- sample(df$Sample, i)
+    df.new <- df %>% filter(Sample %in% sample_list)
+  }
+  return(df.new)
+}
+
+```
+
+# Set Directory Paths
+
+```{r set directory paths}
+cwd <- getwd()
+OUTPUT_DIR=paste0(cwd, "/output_files_downsampling")
+FILE_DIR=paste0(OUTPUT_DIR, "/files")
+FIGURE_DIR=paste0(OUTPUT_DIR, "/figures")
+
+dir.create(OUTPUT_DIR, showWarnings = F)
+dir.create(FILE_DIR, showWarnings = F)
+dir.create(FIGURE_DIR, showWarnings = F)
+```
+
+
+# Set File Variables
+```{r}
+PROJECTS <- c("airs_PRJNA548881", "ballesteros_PRJNA294426", "ballesteros_PRJNA303987", "ballesteros_PRJNA303986", 
+"chevignon_PRJEB40568", "choi_PRJEB2709", "chung_PRJNA294263", "grote_PRJNA557263", 
+"grote_PRJNA344486", "libro_PRJNA329497", "maclean_PRJNA388112", "quek_PRJNA772674")
+GENEINFO_URL <- 'https://raw.githubusercontent.com/Dunning-Hotopp-Lab/lf_transcriptome/master/input_data_files/bmalayi_gene.info'
+ANNOTATION_URL <- "https://raw.githubusercontent.com/christopher-holt/bmalayi_meta_analysis/main/input_files/b_malayi.AF538716.AE017321.PRJNA10729.WS276.annotations.wormbase.gff3"
+GROUPS_URL <- 'https://raw.githubusercontent.com/christopher-holt/bmalayi_meta_analysis/main/input_files/unified_analysis/groups.txt'
+```
+
+# Read in Files
+
+```{r Read in Files}
+# Read in geneinfo
+geneinfo <- readr::read_delim(GENEINFO_URL, delim = '\t', show_col_types = F)
+
+## Read in Groups File
+groups <- utils::read.table(GROUPS_URL, sep = ',')
+
+## Read in Annotation File
+annotations <- readr::read_delim(ANNOTATION_URL, "\t", escape_double = FALSE, col_names = FALSE,
+                                   trim_ws = TRUE, show_col_types = F)
+```
+
+## Read in and combine counts
+
+```{r Read in counts}
+counts.orig <- data.frame()
+for(PROJECT in PROJECTS){
+  COUNTS_URL <- paste0('https://raw.githubusercontent.com/christopher-holt/bmalayi_meta_analysis/main/input_files/', PROJECT, '/combined.final.counts')
+
+  # Read in htseq counts and format into matrix
+  counts.orig.project <- utils::read.table(COUNTS_URL)
+
+  counts.orig <- rbind(counts.orig, counts.orig.project)
+}
+```
+# Format Groups File
+
+```{r format groups}
+
+colnames(groups) <- c("Replicate", "Project")
+groups$Sample <- str_remove(string = groups$Replicate, pattern = '_[a-z]')
+groups$Sample <- str_remove(string = groups$Sample, pattern = '_[1-9]') ## Quek microfilariae data is numbered _1, _2, _3 etc
+
+groups$Replicate <- paste0(groups$Replicate, ".", groups$Project)
+groups <- distinct(groups)
+
+
+### Life Stage
+groups <- groups %>% mutate(WormSex = ifelse(groups$Project %in% c("PRJNA294426", "PRJNA303986", "PRJNA303987", "PRJNA329497"), "female_worm",
+                                             ifelse(groups$Project == "PRJNA772674", "mmf", groups$Sample)))
+
+### Choi Lifecycle
+groups <- groups %>% mutate(WormSex = ifelse(groups$Project == "PRJEB2709" & groups$Sample == "adult.male", "male_worm",
+                                             ifelse(groups$Project == "PRJEB2709" & groups$Sample == "adult.female", "female_worm",
+                                                    ifelse(groups$Project == "PRJEB2709" & groups$Sample == "immature.microfilariae", "imf",
+                                                           ifelse(groups$Project == "PRJEB2709" & groups$Sample == "microfilariae", "mmf", groups$WormSex)))))
+
+### Matt Life Cycle
+groups <- groups %>% mutate(WormSex = ifelse(groups$Project == "PRJNA294263" & groups$Sample == "polyAs_BmAM", "male_worm",
+                                             ifelse(groups$Project == "PRJNA294263" & groups$Sample == "polyAs_BmAF", "female_worm",
+                                                    ifelse(groups$Project == "PRJNA294263" & groups$Sample == "polyAs_BmIMF", "imf",
+                                                           ifelse(groups$Project == "PRJNA294263" & groups$Sample == "polyAs_BmMMF", "mmf", groups$WormSex)))))
+### Grote Life Cycle
+groups <- groups %>% mutate(WormSex = ifelse(groups$Project == "PRJNA344486" & groups$Sample == "Bm.AF.120dpi", "female_worm",
+                                             ifelse(groups$Project == "PRJNA344486" & groups$Sample == "Bm.AM.120dpi", "male_worm", groups$WormSex)))
+
+### Maclean Drug Paper
+groups <- groups %>% mutate(WormSex = ifelse(groups$Project == "PRJNA388112" & grepl("MF", groups$Sample), "mmf",
+                                             ifelse(groups$Project == "PRJNA388112" & grepl("AM", groups$Sample), "male_worm",
+                                                    ifelse(groups$Project == "PRJNA388112" & grepl("AF", groups$Sample), "female_worm", groups$WormSex))))
+
+## L4 Life stage
+groups <- groups %>% mutate(WormSex = ifelse(grepl("L4", groups$Sample), "L4", groups$WormSex))
+
+## Eggs and Embryos
+groups <- groups %>% mutate(WormSex = ifelse(groups$Sample == "eggs.and.embryos" | groups$Sample == "polyAs_BmEm", "Em", groups$WormSex))
+
+
+## L3 Life stage
+groups <- groups %>% mutate(WormSex = ifelse(grepl("L3", groups$Sample) & groups$Sample != "polyAs_BmViL3", "L3", groups$WormSex))
+
+## Site-specific
+groups <- groups %>% mutate(WormSex = ifelse(groups$Sample %in% c('BmAF.Head', 'BmAF.Body', 'BmBodyWall', 'BmMeioticZone', 'BmProliferativeZone'), 'body_site', groups$WormSex))
+
+## Early stage adult males
+groups <- groups %>% mutate(WormSex = ifelse(groups$Sample %in% c('polyAs_Bm20dpiM', 'Bm.AM.30dpi', 'Bm.AM.42dpi'), 'early_male_worm', 
+                                             ifelse(groups$Sample %in% c('Bm.AF.30dpi', 'Bm.AF.42dpi', 'polyAs_Bm24dpiF'), 'early_female_worm',groups$WormSex)))
+## Choi immature microfilariae
+groups <- groups %>% mutate(WormSex = ifelse(groups$Sample == "immature.microfilaria", 'imf', groups$WormSex))
+
+## Vector Stage
+groups <- groups %>% mutate(WormSex = ifelse(grepl('polyAs_BmV', groups$Sample) | grepl('agss_BmV', groups$Sample), 'vector_stage', groups$WormSex))
+
+## Combining the L3 stages from Matts paper
+groups <- groups %>% mutate(WormSex = ifelse(groups$Sample %in% c('polyAs_Bm1dpi', 'polyAs_Bm2dpi', 'polyAs_Bm3dpi', 'polyAs_Bm4dpi', 'polyAs_Bm8dpi'), 'L3', groups$WormSex))
+
+
+## Treatment
+groups <- groups %>% mutate(Treatment = ifelse(grepl("IVM", groups$Replicate), "IVM",
+                                               ifelse(grepl("DEC", groups$Replicate), "DEC",
+                                                      ifelse(grepl("Alb", groups$Replicate), 'Alb',
+                                                             ifelse(grepl("DMSO", groups$Replicate), "DMSO", 
+                                                                    ifelse(grepl("mf.treated", groups$Replicate),"tetracycline" ,"untreated"))))))
+
+## Ballesteros IVM Study
+groups <- groups %>% mutate(Treatment = ifelse(groups$Project %in% c("PRJNA303986", "PRJNA303987") & grepl('IVM.0nM', groups$Replicate), 'DMSO', groups$Treatment))
+
+
+
+## Set Colours for Treatment
+groups <- groups %>% mutate(TreatmentColour = ifelse(groups$Treatment == "IVM", "grey",
+                                                     ifelse(groups$Treatment == "Alb", "black",
+                                                            ifelse(groups$Treatment == "DEC", "orange",
+                                                                   ifelse(groups$Treatment == "DMSO", "green", 
+                                                                          ifelse(groups$Treatment == "tetracycline", "purple4","gold3"))))))
+
+groups <- groups %>% mutate(WormColour = ifelse(groups$WormSex == 'female_worm', 'blue',
+                                                ifelse(groups$WormSex == 'early_female_worm', 'cyan',
+                                                       ifelse(groups$WormSex == 'male_worm', 'red',
+                                                              ifelse(groups$WormSex == 'early_male_worm', 'brown',
+                                                                     ifelse(groups$WormSex == "L3", 'lightgreen',
+                                                                            ifelse(groups$WormSex == "L4", 'orange',
+                                                                                   ifelse(groups$WormSex == "mmf", "grey",
+                                                                                          ifelse(groups$WormSex == "imf", 'black',
+                                                                                                 ifelse(groups$WormSex == 'body_site', 'gold3',
+                                                                                                        ifelse(groups$WormSex == 'vector_stage', 'plum', 'white')))))))))))
+
+
+groups$WormSex_Treatment <- paste0(groups$WormSex, '_', groups$Treatment)
+
+
+
+groups <- groups %>% mutate(ProjectColour = ifelse(groups$Project== "PRJNA548881", "red",
+                                                   ifelse(groups$Project == "PRJNA294426", "purple",
+                                                          ifelse(groups$Project == "PRJNA303986", "blue",
+                                                                 ifelse(groups$Project == "PRJNA303987", "orange",
+                                                                        ifelse(groups$Project == "PRJEB40568", "green",
+                                                                               ifelse(groups$Project == "PRJEB2709", "violet",
+                                                                                      ifelse(groups$Project == "PRJNA294263", "grey",
+                                                                                             ifelse(groups$Project == "PRJNA557263", "black",
+                                                                                                    ifelse(groups$Project == "PRJNA344486", "brown",
+                                                                                                           ifelse(groups$Project == "PRJNA329497", "darkgreen",
+                                                                                                                  ifelse(groups$Project == "PRJNA388112", "cyan",
+                                                                                                                         ifelse(groups$Project == "PRJNA772674", "pink", NA)))))))))))))
+
+
+groups$Sample <- paste0(groups$Sample, ".", groups$Project)
+
+counts.orig$V3 <- paste0(counts.orig$V3, ".", counts.orig$V4)
+
+
+
+
+
+male_worms <- groups %>% filter(WormSex == "male_worm" & Project == "PRJNA388112")
+male_worms <- downsample_groups(male_worms,9, 18)
+
+mf <- groups %>% filter(WormSex == "mmf" & Project == "PRJNA388112")
+mf <- downsample_groups(mf,9, 18)
+
+
+female_worms_one <- groups %>% filter(WormSex == "female_worm" & Project %in% c("PRJNA303987", "PRJNA303986")) 
+female_worms_one <- downsample_groups(female_worms_one,4, 9)
+
+female_worms_two <- groups %>% filter(WormSex == "female_worm" & Project == "PRJNA388112")
+female_worms_two <- downsample_groups(female_worms_two,4, 9)
+
+groups <- factor_groups(rbind(male_worms, mf, female_worms_one, female_worms_two))
+
+
+counts.orig <- counts.orig[counts.orig$V3 %in% levels(groups$Replicate),]
+
+
+```
+
+
+
+# Calculate Gene Lengths
+```{r}
+
+annotations <- annotations %>% separate('X9', into = c("Name", "X9"), sep = ';')
+annotations$X9 <- gsub(".*:", "", annotations$X9)
+annotations$X9 <- gsub(".*=", "", annotations$X9)
+annotations$Name <- gsub(".*:", "", annotations$Name)
+annotations$Name <- gsub(".*=", "", annotations$Name)
+
+genes_list <- annotations %>% filter(X3 == "gene")
+
+genes_list$length <- genes_list$X5 - genes_list$X4
+
+## Contains the gene name and gene length
+gene_length_df <- genes_list %>% select('Name', 'length')
+```
+
+## Format GeneInfo File
+
+```{r format geneinfo}
+geneinfo$gene <- stringr::str_replace_all(geneinfo$gene, "Gene:", "")
+## Add in mitochondrial genes to gene info
+geneinfo <- add_mitochondrial_genes(df = geneinfo, column_name = "gene")
+
+## Fix NA Values
+geneinfo$interpro_description[which(is.na(geneinfo$interpro_description))] <- "No InterPro entry"
+geneinfo$go_biologicalprocess[which(is.na(geneinfo$go_biologicalprocess))] <- "No GO terms for biological process"
+geneinfo$go_cellularcomponent[which(is.na(geneinfo$go_cellularcomponent))] <- "No GO terms for cellular component"
+geneinfo$go_molecularfunction[which(is.na(geneinfo$go_molecularfunction))] <- "No GO terms for molecular function"
+```
+
+## Format Tidy Counts File into Counts Matrix
+
+```{r format counts file}
+## rRNAs that have been misannotated
+genes_overlapping_with_rRNAs <- c("WBGene00228061", "WBGene00268654", "WBGene00268655", "WBGene00268656", "WBGene00268657", "WBGene00221211", "WBGene00220288", 
+"WBGene00220284", "WBGene00268299", "WBGene00228060", "WBGene00268300")
+## Rename columns into Names and Counts
+colnames(counts.orig) <- c("Name", "counts", "replicate", "Project")
+counts.orig$counts <- as.double(counts.orig$counts)
+```
+
+```{r}
+## Remove Gene: prefix from gene names
+counts.orig$Name <- stringr::str_replace_all(counts.orig$Name, "Gene:", "")
+counts.orig <- counts.orig %>% dplyr::arrange(replicate, Name)
+## Remove __* lines generated from HTSeq-Counts
+counts.orig <- counts.orig[!grepl("__", counts.orig$Name),]
+## Remove genes overlapping with rRNAs
+counts.orig <- counts.orig[!(counts.orig$Name %in% genes_overlapping_with_rRNAs),]
+```
+
+
+```{r}
+## Remove all counts mapping to Wolbachia
+counts.orig <- counts.orig[!(grepl("Wbm", counts.orig$Name)),] ## Remove Wolbachia counts
+
+counts.orig <- dplyr::inner_join(counts.orig, gene_length_df, by = "Name") %>% arrange(replicate, Name)
+```
+## Convert counts data frame to counts matrix (row = gene, columns = replicate, values are counts)
+
+```{r}
+counts <- create_matrix(df = counts.orig %>% select(-"Project", -contains("length")), row = "Name", centre = "counts", column = "replicate")
+colnames(counts) <- str_replace_all(colnames(counts), "nm", "nM")
+colnames(counts) <- str_replace_all(colnames(counts), "um", "uM")
+
+```
+
+```{r}
+mRNA_features <- annotations %>% filter(X3 == "mRNA")
+## Format names to isolate gene name
+mRNA_features$X9 <- str_remove(mRNA_features$X9, "Parent=Gene:")
+mRNA_features$Name <- gsub(".*:", "", mRNA_features$Name)
+mRNA_features <- unique(mRNA_features$X9)
+
+## Remove the mitochondrial genes from couints
+counts.mito <- counts[grepl("gene-", rownames(counts)),]
+## Select only genes in mRNAs list
+counts.WB.mRNA <- counts[(rownames(counts) %in% mRNA_features),]
+## Combine mRNA gene counts with mitochondrial gene counts
+counts <- rbind(counts.mito, counts.WB.mRNA)
+
+```
+
+
+## Convert Counts Matrix into TPM
+
+```{r convert to tpm}
+## Make sure that the tidy counts dataframe has the same genes as the counts matrix
+counts.orig <- counts.orig[(counts.orig$Name %in% rownames(counts)),] 
+
+if(all(rownames(counts) == unique(counts.orig$Name))){ ## Makes sure the genes are in the same order for the correct division
+
+  tpm <- calculate_TPM(counts.mat = counts, counts.orig = counts.orig)
+
+}else{
+  message('The genes are not in the same order')
+}
+
+counts <- counts[,levels(groups$Replicate)]
+tpm <- tpm[,levels(groups$Replicate)]
+
+
+```
+
+
+```{r}
+
+## Calculate Differential Expression
+FDRcutoff <- 0.05
+cpm.cutoff <- (5/min(colSums(counts))) * 1000000 ## list minimum counts per million
+print(paste0(nrow(counts)," total genes"))
+y <- edgeR::DGEList(counts = counts, group = groups$Sample)
+y <- edgeR::calcNormFactors(y)
+keep <- rowSums(cpm(y) >= cpm.cutoff) >= min(table(groups$Sample)) ## is the cpm > than cutoff in two or more replicates
+keep.df <- as.data.frame(table(keep))
+print(paste0(keep.df[keep.df[,1] == F,2]," genes excluded using edgeR filter"))
+y <- y[keep, , keep.lib.sizes = F] ## Selects genes in y that are in keep
+design <- model.matrix(~groups$Sample)
+y <- estimateDisp(y , design)
+## Next two steps use Genewise negative binomial generalised linear models with quasilikelihood tests
+fit <- edgeR::glmQLFit(y, design) 
+qlf <- edgeR::glmQLFTest(fit, coef = 2:ncol(fit)) 
+FDR <- as.data.frame(p.adjust(qlf$table$PValue, method="BH")) ## Takes pvalue from above and correct using FDR method
+rownames(FDR) <- rownames(qlf$table)
+colnames(FDR) <- FDR
+degenes <- rownames(FDR[FDR[,1] < FDRcutoff, , drop = F]) ## Select genes with FDR less than FDR cutoff
+print(paste0(length(degenes)," DE genes"))
+
+genes_not_passing_edger_filter <- counts[!rownames(counts) %in% degenes,]
+
+tpm.de <- tpm[rownames(tpm) %in% degenes,]
+
+```
+
+
+```{r pvclust bootstrap of all samples, echo=TRUE}
+tpm_dendrogram <- pvclust::pvclust(as.data.frame(t(scale(t(log2(tpm.de + 1))))), method.dist="cor", method.hclust="average",
+                                   nboot=1000, parallel=TRUE)
+
+pdf(paste0(FIGURE_DIR, "/dendrogram_downsample.pdf"),
+    width = 50,
+    height = 10)
+  plot(tpm_dendrogram)
+invisible(dev.off())
+
+
+dendro.data <- ggdendro::dendro_data(tpm_dendrogram$hclust)
+dendro_order <- dendro.data$labels %>% select('label')
+
+sample_order <- factor(as.character(dendro_order$label), levels = as.character(dendro_order$label))
+
+
+groups <- factor_groups(groups[order(match(groups$Replicate, as.character(sample_order))),])
+
+rownames(groups) <- NULL
+
+```
+
+## WGCNA Version
+```{r}
+
+wgcna <- as.data.frame(t(tpm.de))
+powers <- c(c(1:10), seq(from = 12, to=20, by=2))
+sft <- pickSoftThreshold(wgcna, powerVector = powers, verbose = 5)
+softpower <- find_soft_power(sft)
+
+adjacency <- adjacency(wgcna, power = softpower)
+TOM <- TOMsimilarity(adjacency)
+dissTOM <- 1-TOM
+geneTree <- hclust(as.dist(dissTOM), method = "average");
+minModuleSize <- 1
+dynamicMods <- cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                             deepSplit = 2, pamRespectsDendro = FALSE,
+                             minClusterSize = minModuleSize)
+dynamicColors = labels2colors(dynamicMods)
+MEList = moduleEigengenes(wgcna, colors = dynamicColors)
+MEs = MEList$eigengenes
+MEDiss = 1-cor(MEs, use = "pairwise.complete.obs")
+METree = hclust(as.dist(MEDiss), method = "average")
+MEDissThres = 0.25
+
+
+merge = mergeCloseModules(wgcna, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+mergedColors = merge$colors
+mergedMEs = merge$newMEs
+
+tpm.de.wgcna <- eigengene_invert_id(tpm.de, mergedColors, mergedMEs)
+tpm.de.wgcna <- wgcna_heatmap_reorder(tpm.de.wgcna)
+
+log2tpm.de <- log2(tpm.de.wgcna[,1:(ncol(tpm.de.wgcna) - 2)] + 1)
+zscore.log2tpm.de <- as.data.frame(t(scale(t(log2tpm.de))))
+
+zscore.log2tpm.de <- zscore.log2tpm.de[,as.character(sample_order)]
+
+
+##-----------------------------------------------------------------------------------------------------------
+## Add invert and module column to the zscore dataframe
+##-----------------------------------------------------------------------------------------------------------
+
+zscore.log2tpm.de <- inner_join(zscore.log2tpm.de %>% rownames_to_column('gene'), 
+           tpm.de.wgcna %>% select('invert', 'module') %>% rownames_to_column('gene'), by = 'gene') %>% column_to_rownames('gene')
+log2tpm.de <- inner_join(log2tpm.de %>% rownames_to_column('gene'), 
+           tpm.de.wgcna %>% select('invert', 'module') %>% rownames_to_column('gene'), by = 'gene') %>% column_to_rownames('gene')
+
+
+hmcol <- colorRampPalette(c("navyblue","white","firebrick3"))(12)
+colcol <- as.character(groups$ProjectColour)
+colsep <- get_heatmap_separators(colcol)
+breaks <- seq(-3,3,by=.5)
+
+colcol1 <- as.character(groups$TreatmentColour)
+colcol2 <- as.character(groups$WormColour)
+
+colcol3 <- cbind(colcol, colcol1, colcol2)
+rowcol <- zscore.log2tpm.de$module
+rowsep <- get_heatmap_separators(rowcol)
+
+rowcol1 <- zscore.log2tpm.de$invert
+rowcol1[rowcol1 == F] <- "grey" ## matching pattern
+rowcol1[rowcol1 == T] <- "black" ## inverted pattern
+
+rowcol2 <- t(cbind(rowcol, rowcol1))
+
+
+##-----------------------------------------------------------------------------------------------------------
+## Set the row colours and coloumn colours as matrices
+##-----------------------------------------------------------------------------------------------------------
+
+rownames(rowcol2) <- c('Main', 'Inverse')
+rowcol2 <- as.matrix((rowcol2))
+
+colnames(colcol3) <- c('ProjectColour', 'TreatmentColour', 'WormColour')
+colcol3 <- as.matrix(colcol3)
+
+
+
+heatmap_matrix <- as.matrix(zscore.log2tpm.de[,(1:(ncol(zscore.log2tpm.de)-2))])
+heatmap_matrix <- heatmap_matrix[,as.character(sample_order)]
+
+
+pdf(paste0(FIGURE_DIR, "/Supplementary_Figure_3.pdf"),
+    width = 20,
+    height = 10)
+heatmap.3(heatmap_matrix,
+              col=hmcol,
+              trace="none",
+              labRow = NA,
+              labCol = F,
+              Rowv = F,
+              Colv = F,
+              RowSideColors=rowcol2,
+              RowSideColorsSize = 1,
+              ColSideColorsSize = 4,
+              ColSideColors=colcol3,
+              lhei = c(2,8,1),
+              breaks = breaks,
+              #rowsep = rowsep,
+              #colsep = colsep,
+              density.info = 'histogram',
+              dendrogram = "none")
+invisible(dev.off())
+
+```
+
+
+
+## Number of genes in each cluster
+```{r}
+table_of_gene_number_in_heatmap <- tibble('Type_of_Comparison' = as.character() ,
+                                          'Number_of_Genes_in_Heatmap' = as.numeric())
+
+for(cluster in unique(tpm.de.wgcna$module)){
+  for(invert_type in unique(tpm.de.wgcna$invert)){
+      table_of_gene_number_in_heatmap <- table_of_gene_number_in_heatmap %>% 
+        add_row(Type_of_Comparison = paste0(cluster, "_", invert_type),
+          Number_of_Genes_in_Heatmap = nrow(tpm.de.wgcna %>% filter(module == cluster & invert == invert_type)))
+  }
+}
+
+```
+
+
+```{r}
+#### Functional term enrichment
+terms.colnames <- c("term","clusteroccurences","genomeoccurences","pvalue","correctedpvalue","oddsratio","clusterProportion",
+                    "clusterSize", "genomeProportion", "genomeSize", "newOddsRatio" ,"module","invert")
+terms.wgcna <- as.data.frame(matrix(nrow = 0,
+                                    ncol = length(terms.colnames)))
+colnames(terms.wgcna) <- terms.colnames
+
+functionalterms.list <- consolidate_functional_terms(geneinfo)
+
+for(i in 1:length(unique(tpm.de.wgcna$module))){ ## tpm.de.wgcna is the mitochondrial counts and clusters
+  ## First part selects the genes that match the invert value and module ID which becomes the gene list for the functionalenrichment function, then paste in gene info to get the gene descriptions.
+  terms.wgcna.f <- as.data.frame(cbind(functionaltermenrichment(rownames(zscore.log2tpm.de)[zscore.log2tpm.de$module == unique(zscore.log2tpm.de$module)[i] & zscore.log2tpm.de$invert == F],geneinfo, functionalterms.list),
+                                       unique(zscore.log2tpm.de$module)[i],F))
+  terms.wgcna.t <- as.data.frame(cbind(functionaltermenrichment(rownames(zscore.log2tpm.de)[zscore.log2tpm.de$module == unique(zscore.log2tpm.de$module)[i] & zscore.log2tpm.de$invert == T],geneinfo, functionalterms.list),
+                                       unique(zscore.log2tpm.de$module)[i],T))
+  
+  colnames(terms.wgcna.f) <- terms.colnames
+  colnames(terms.wgcna.t) <- terms.colnames
+  terms.wgcna <- as.data.frame(rbind(terms.wgcna,
+                                     terms.wgcna.f, 
+                                     terms.wgcna.t))
+}
+
+pvalue.cutoff <- 0.05
+terms.wgcna.sig <- terms.wgcna[as.numeric(as.character(terms.wgcna$correctedpvalue)) < pvalue.cutoff,]
+print(paste0(nrow(terms.wgcna.sig)," significantly over-/under-represented terms in WGCNA modules"))
+
+
+```
+
+```{r}
+## All wgcna terms
+write.table(terms.wgcna,
+            paste0(FILE_DIR,"/functionaltermenrichment_wgcna.tsv"), 
+            row.names = F,
+            col.names = T,
+            quote = F,
+            sep = "\t")
+
+## All Significant Terms
+write.table(terms.wgcna.sig,
+            paste0(FILE_DIR,"/functionaltermenrichment_sig_wgcna.tsv"), 
+            row.names = F,
+            col.names = T,
+            quote = F,
+            sep = "\t")
+
+## All significantly enriched terms with an odds ratio >= 1
+write.table(terms.wgcna.sig %>% filter(oddsratio >= 1) ,
+            paste0(FILE_DIR,"/functionaltermenrichment_sig_wgcna_overrep.tsv"), 
+            row.names = F,
+            col.names = T,
+            quote = F,
+            sep = "\t")
+## All significantly enriched terms with an odds ratio < 1
+write.table(terms.wgcna.sig %>% filter(oddsratio < 1) ,
+            paste0(FILE_DIR,"/functionaltermenrichment_sig_wgcna_underrep.tsv"), 
+            row.names = F,
+            col.names = T,
+            quote = F,
+            sep = "\t")
+
+## Table of number of genes per cluster
+write.table(table_of_gene_number_in_heatmap ,
+            paste0(FILE_DIR,"/table_of_heatmap.tsv"), 
+            row.names = F,
+            col.names = T,
+            quote = F,
+            sep = "\t")
+
+write.table(tpm.de.wgcna %>% rownames_to_column('gene'),
+            paste0(FILE_DIR,"/tpm.de.wgcna.tsv"), 
+            row.names = F,
+            col.names = T,
+            quote = F,
+            sep = "\t")
+
+
+write.table(rownames(genes_not_passing_edger_filter),
+            paste0(FILE_DIR,"/genes_not_passing_edger_filter.tsv"), 
+            row.names = F,
+            col.names = T,
+            quote = F,
+            sep = "\t")
+
+```
+
