@@ -1,0 +1,842 @@
+---
+title: "Reanalysis of Quek et al 2022, PRJNA772674"
+author: "Christopher Holt"
+date: "23-May-2024"
+output: pdf_document
+---
+
+# Load Libraries
+
+```{r Load in libraries}
+library(edgeR)
+library(FactoMineR)
+library(ggdendro)
+library(tidyverse)
+library(pvclust)
+library(variancePartition)
+library(WGCNA)
+library(devtools)
+devtools::source_url("https://raw.githubusercontent.com/obigriffith/biostar-tutorials/master/Heatmaps/heatmap.3.R")
+```
+
+# Session Info
+
+```{r print session info}
+sessionInfo()
+```
+
+# Load in Functions
+
+```{r load functions}
+## Add mitochondrial gene information to GENEINFO
+add_mitochondrial_genes <- function(df, column_name){
+  df <- df %>% mutate("{column_name}" := ifelse(grepl('gene11440', df[[column_name]]), 'gene-nad2',
+                                                ifelse(grepl('gene11441', df[[column_name]]), 'gene-nad4',
+                                                       ifelse(grepl('gene11442', df[[column_name]]), 'gene-cox1',
+                                                              ifelse(grepl('gene11443', df[[column_name]]), 'gene-nad6',
+                                                                     ifelse(grepl('gene11444', df[[column_name]]), 'gene-cob',
+                                                                            ifelse(grepl('gene11445', df[[column_name]]), 'gene-cox3',
+                                                                                   ifelse(grepl('gene11446', df[[column_name]]), 'gene-nad4L',
+                                                                                          ifelse(grepl('gene11447', df[[column_name]]), 'gene-nad1',
+                                                                                                 ifelse(grepl('gene11448', df[[column_name]]), 'gene-atp6',
+                                                                                                        ifelse(grepl('gene11449', df[[column_name]]), 'gene-cox2',
+                                                                                                               ifelse(grepl('gene11450', df[[column_name]]), 'gene-nad3',
+                                                                                                                      ifelse(grepl('gene11451', df[[column_name]]), 'gene-nad5', df[[column_name]])))))))))))))
+
+
+  return(df)
+
+}
+
+create_matrix <- function(df, row, centre, column){
+  df <- as.data.frame(df)
+  test <- df %>% select(all_of(row), all_of(centre), all_of(column))
+  replicates.test <- unique(test[[column]])
+  tmp.matrix <- tibble(gene=unique(df[[row]])) ## row
+  for (replicate_uniq in replicates.test){
+    tmp <- test %>% filter(!!as.symbol(column) == replicate_uniq)
+    colnames(tmp)[2] <- replicate_uniq
+    tmp[[column]] <- NULL
+    tmp.matrix <- inner_join(tmp.matrix, tmp, by = c('gene' = row))
+  }
+
+  tmp.matrix <- tmp.matrix %>% tibble::column_to_rownames('gene')
+  return(tmp.matrix)
+
+}
+
+
+calculate_TPM <- function(counts.mat, counts.orig){
+  gene_length <- counts.orig %>% select('Name', 'length') %>% unique
+  for (i in 1:ncol(counts.mat)){
+    counts.mat[,i] <- counts.mat[,i]/gene_length[,2]
+    counts.mat[,i] <- counts.mat[,i]/(sum(counts.mat[,i])/1000000)
+  }
+
+  return(counts.mat)
+}
+
+find_soft_power <- function(sft){
+  df <- as.data.frame(cbind(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2]))
+  y <- -sign(sft$fitIndices[,3])*sft$fitIndices[,2]
+  dy <- diff(y) 
+  softpower <- which(abs(diff(y)) < 0.05)[1]
+  return(softpower)
+}
+
+eigengene_invert_id <- function(tpm.de.wgcna, mergedColors, mergedMEs){
+  tpm.de <- tpm.de.wgcna
+  tpm.de.wgcna$invert <- T
+  tpm.de.wgcna$module <- mergedColors
+  for(i in 1:nrow(tpm.de.wgcna)){
+    if(cor(t(tpm.de[i,]), mergedMEs[,which(colnames(mergedMEs) == paste0("ME",tpm.de.wgcna$module[i]))], method = "pearson") >= 0){
+      tpm.de.wgcna$invert[i] <- F
+    }
+  }
+  return(tpm.de.wgcna)
+}
+
+wgcna_heatmap_reorder <- function(tpm.de.wgcna){
+  clusters <- as.data.frame(table(tpm.de.wgcna$module))
+  clusters <- clusters[order(-clusters[,2]),1]
+
+  tpm.de.wgcna.reordered <- as.data.frame(matrix(nrow = 0,
+                                                 ncol = ncol(tpm.de.wgcna)))
+  for(i in 1:length(clusters)){
+    tpm.de.wgcna.reordered <- as.data.frame(rbind(tpm.de.wgcna.reordered,
+                                                  tpm.de.wgcna[tpm.de.wgcna$module == clusters[i] & tpm.de.wgcna$invert == F,],
+                                                  tpm.de.wgcna[tpm.de.wgcna$module == clusters[i] & tpm.de.wgcna$invert == T,]))
+  }
+  return(tpm.de.wgcna.reordered)
+}
+
+get_heatmap_separators <- function(vector){
+  sep <- c()
+  for(i in 2:length(unique(vector))){
+    sep[length(sep) + 1] <- min(which(vector == unique(vector)[i])) - 1
+  }
+  return(sep)
+}
+
+
+eigengene_refit <- function(tpm.de, mergedMEs, min_pearson_corr = 0.8){
+  tpm.de.wgcna <- tpm.de
+  tpm.de.wgcna$invert <- T
+  tpm.de.wgcna$module <- NA
+  for(i in 1:nrow(tpm.de)){
+    minimum_correlation <- min_pearson_corr
+    for(j in 1:ncol(mergedMEs)){
+      cor <- abs(cor(t(tpm.de[i,]), mergedMEs[,j], method = "pearson"))
+      if(cor > minimum_correlation){
+        minimum_correlation <- cor
+        tpm.de.wgcna$module[i] <- colnames(mergedMEs)[j]
+      }
+    }
+    if(!is.na(tpm.de.wgcna$module[i])){
+      if(cor(t(tpm.de[i,]), mergedMEs[,which(colnames(mergedMEs) == tpm.de.wgcna$module[i])], method = "pearson") > 0){
+        tpm.de.wgcna$invert[i] <- F
+      }
+    }else{
+      tpm.de.wgcna$invert[i] <- NA
+    }
+
+  }
+  tpm.de.wgcna$module <- gsub("^ME","",tpm.de.wgcna$module)
+  return(tpm.de.wgcna)
+}
+
+consolidate_functional_terms <- function(geneinfo){
+
+  ipr <- as.data.frame(unlist(strsplit(paste(geneinfo$interpro_description, collapse = "|"),  split = "[|]")))
+  gobio <- as.data.frame(unlist(strsplit(paste(geneinfo$go_biologicalprocess, collapse = "|"),  split = "[|]")))
+  gocell <- as.data.frame(unlist(strsplit(paste(geneinfo$go_cellularcomponent, collapse = "|"),  split = "[|]")))
+  gomol <- as.data.frame(unlist(strsplit(paste(geneinfo$go_molecularfunction, collapse = "|"),  split = "[|]")))
+
+  ipr <- as.data.frame(table(ipr))
+  gobio <- as.data.frame(table(gobio))
+  gocell <- as.data.frame(table(gocell))
+  gomol <- as.data.frame(table(gomol))
+
+  functionalterms.list <- list(ipr = ipr, gobio = gobio, gocell = gocell, gomol = gomol)
+
+  return(functionalterms.list)
+}
+
+
+functionaltermenrichment <- function(genes, geneinfo, functionalterms.list){
+
+  geneinfo.subset <- geneinfo[geneinfo$gene %in% genes,]
+  term <- c()
+  clusteroccurences <- c()
+  genomeoccurences <- c()
+  pvalue <- c()
+  correctedpvalue <- c()
+  oddsratio <- c()
+  clusterProportion <- c()
+  genomeProportion <- c()
+  clusterSize <- c()
+  genomeSize <- c()
+  newOddsRatio <- c()
+
+  functionalterms.list.subset <- consolidate_functional_terms(geneinfo.subset)
+
+  for(i in 1:length(functionalterms.list)){
+    for(j in 1:nrow(functionalterms.list[[i]])){
+
+      freq.all <- functionalterms.list[[i]][j,2] ## How amany times the IPR/GO term appears in the entire geneinfo file
+
+      ## determine if the functional term is in the subset
+      ## If it isn't, then the frequency is set to 0
+      ## If it is in the subset, then extract the frequency of the IPR/GO term from within the subset
+      freq.subset <- ifelse(functionalterms.list[[i]][j,1] %in% functionalterms.list.subset[[i]][,1],
+                            functionalterms.list.subset[[i]][functionalterms.list.subset[[i]][,1] == as.character(functionalterms.list[[i]][j,1]),2],
+                            0)
+
+      ## Number of genes in the whole genome
+      genes.all <- nrow(geneinfo)
+
+      ## Number of genes in the cluster
+      genes.subset <- nrow(geneinfo.subset)
+      # [col.row]
+      ## [1,1] is frequency is the subset, [1,2] is remaining frequency in rest of gene term file (col 1 total is total frequency of term in genome)
+      ## [2,1] is no. genes that do not have this term in the subset, [2,2] is no. genes that do not have this term in genome (minus genes in subset)
+      fisherexact.matrix <- matrix(c(freq.subset, freq.all - freq.subset,
+                                     genes.subset - freq.subset, genes.all - genes.subset - freq.all + freq.subset),
+                                   nrow = 2,
+                                   ncol = 2)
+      fisher.test <- fisher.test(fisherexact.matrix)
+
+      term[length(term) + 1] <- as.character(functionalterms.list[[i]][j,1])
+      clusteroccurences[length(clusteroccurences) + 1] <- as.numeric(as.character(freq.subset))
+      genomeoccurences[length(genomeoccurences) + 1] <- as.numeric(as.character(freq.all))
+      pvalue[length(pvalue) + 1] <- as.numeric(as.character(fisher.test$p.value))
+      correctedpvalue[length(correctedpvalue) + 1] <- p.adjust(as.numeric(as.character(fisher.test$p.value)), method = "fdr", n = nrow(functionalterms.list[[i]]))
+      oddsratio[length(oddsratio) + 1] <- as.numeric(as.character(fisher.test$estimate)) ## if < 1, term is under represented in the clutser
+
+      clusterProportion[length(clusterProportion) + 1] <- as.numeric(fisherexact.matrix[1,1]/fisherexact.matrix[2,1])
+      clusterSize[length(clusterSize) + 1] <- as.numeric(fisherexact.matrix[2,1])
+      genomeProportion[length(genomeProportion) + 1] <- as.numeric(fisherexact.matrix[1,2]/fisherexact.matrix[2,2])
+      genomeSize[length(genomeSize) + 1] <- as.numeric(fisherexact.matrix[2,2])
+
+      newOddsRatio[length(newOddsRatio) + 1] <- as.numeric((fisherexact.matrix[1,1]/fisherexact.matrix[2,1])/(fisherexact.matrix[1,2]/fisherexact.matrix[2,2]))
+
+    }
+  }
+
+  terms.df <- as.data.frame(cbind(term,
+                                  clusteroccurences,
+                                  genomeoccurences,
+                                  pvalue,
+                                  correctedpvalue,
+                                  oddsratio,
+                                  clusterProportion,
+                                  clusterSize,
+                                  genomeProportion,
+                                  genomeSize,
+                                  newOddsRatio))
+  terms.df <- terms.df[order(as.numeric(as.character(terms.df$pvalue))),]
+  return(terms.df)
+}
+  
+ggplot_legend <- function(a.gplot){ 
+  tmp <- ggplot_gtable(ggplot_build(a.gplot)) 
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box") 
+  legend <- tmp$grobs[[leg]] 
+  return(legend)
+
+}
+tidy_matrix <- function(df){
+  tidy_df <- tibble()
+  cols <- colnames(df %>% select(-'invert', -'module'))
+  for(col in cols){
+    tmp <- df %>% select(col)
+    colnames(tmp)[1] <- 'z_score'
+    tmp$replicate <- col
+    tmp <- tmp %>% rownames_to_column('gene')
+    tmp <- tmp %>% select('gene', 'replicate', 'z_score')
+    tidy_df <- rbind(tidy_df, tmp)
+  }
+  
+  tidy_df <- inner_join(tidy_df,
+                        df %>%
+                          rownames_to_column('gene') %>%
+                          select('gene', 'invert', 'module'),
+                        by = 'gene')
+  
+  return(tidy_df)
+}
+
+variance_function <- function(counts.to.use, groups.to.use, form){
+  y <- edgeR::DGEList(counts = counts.to.use)
+  y <- edgeR::calcNormFactors(y)
+  design <- stats::model.matrix(~groups.to.use$Sample)
+  
+  y <- limma::voom(y, design)
+  
+  varPart <- fitExtractVarPartModel(y, form, groups.to.use)
+  
+  varPart.df <- gg_plotvar(varPart)
+  
+  return(varPart.df)
+}
+
+gg_plotvar <- function(varPart){
+  varPart.df <- data.frame()
+  varPart <- as.data.frame(varPart) %>% rownames_to_column('gene')
+  for(col in colnames(varPart)[colnames(varPart) != 'gene']){
+    df <- as.data.frame(varPart) %>% select('gene',all_of(col))
+    df$attribute <- col
+    colnames(df)[2] <- 'Variance_Explained'
+    
+    varPart.df <- rbind(varPart.df, df)
+  }
+  
+  
+  varPart.df$attribute <- factor(varPart.df$attribute, levels = unique(varPart.df$attribute))
+
+  
+  return(varPart.df)
+
+}
+median_variance <- function(varPart.df, attr_list){
+  
+  for(attr in attr_list){
+    message(paste0(attr))
+      print(
+    median(varPart.df[varPart.df$attribute == paste0(attr),]$Variance_Explained)
+  )
+  }
+}
+
+
+factor_groups <- function(GROUPS){
+  
+  for (col in colnames(GROUPS)){
+    GROUPS[[col]] = factor(GROUPS[[col]], levels = unique(GROUPS[[col]]))
+  }
+  
+  return(GROUPS)
+}
+
+```
+
+# Set Directory Paths
+
+```{r set directory paths}
+PROJECT="quek_PRJNA772674"
+cwd <- getwd()
+OUTPUT_DIR=paste0(cwd, "/output_files_", PROJECT)
+FILE_DIR=paste0(OUTPUT_DIR, "/files_new")
+FIGURE_DIR=paste0(OUTPUT_DIR, "/figures_new")
+
+dir.create(OUTPUT_DIR, showWarnings = F)
+dir.create(FILE_DIR, showWarnings = F)
+dir.create(FIGURE_DIR, showWarnings = F)
+```
+
+# Set File Variables
+```{r}
+GENEINFO_URL <- 'https://raw.githubusercontent.com/Dunning-Hotopp-Lab/lf_transcriptome/master/input_data_files/bmalayi_gene.info'
+ANNOTATION_URL <- "https://raw.githubusercontent.com/christopher-holt/bmalayi_meta_analysis/main/input_files/b_malayi.AF538716.AE017321.PRJNA10729.WS276.annotations.wormbase.gff3"
+COUNTS_URL <- paste0('https://raw.githubusercontent.com/christopher-holt/bmalayi_meta_analysis/main/input_files/', PROJECT, '/combined.final.counts')
+GROUPS_URL <- paste0('https://raw.githubusercontent.com/christopher-holt/bmalayi_meta_analysis/main/input_files/', PROJECT, '/groups.txt')
+```
+
+# Read in Files
+
+```{r Read in Files}
+# Read in geneinfo
+geneinfo <- readr::read_delim(GENEINFO_URL, delim = '\t', show_col_types = F)
+
+## Read in Groups File
+groups <- utils::read.table(GROUPS_URL, sep = ',')
+
+# Read in htseq counts and format into matrix
+counts.orig <- utils::read.table(COUNTS_URL)
+
+
+## Read in Annotation File
+annotations <- readr::read_delim(ANNOTATION_URL, "\t", escape_double = FALSE, col_names = FALSE,
+                                   trim_ws = TRUE, show_col_types = F)
+```
+
+# Format Groups File
+
+```{r format groups}
+groups <- as.data.frame(groups)
+groups <- groups %>% select(-'V1') %>% distinct()
+groups$Sample <- str_remove(string = groups$V2, pattern = '_[0-9]')
+groups <- groups %>% mutate(SampleColour = ifelse(grepl("untreated", groups$Sample), "black", "grey"))
+
+
+colnames(groups) <- c("Replicate", "Project", "Sample", 'SampleColour')
+
+groups <- factor_groups(groups)
+
+```
+
+
+
+
+# Calculate Gene Lengths
+```{r}
+
+annotations <- annotations %>% separate('X9', into = c("Name", "X9"), sep = ';')
+annotations$X9 <- gsub(".*:", "", annotations$X9)
+annotations$X9 <- gsub(".*=", "", annotations$X9)
+annotations$Name <- gsub(".*:", "", annotations$Name)
+annotations$Name <- gsub(".*=", "", annotations$Name)
+
+genes_list <- annotations %>% filter(X3 == "gene")
+
+genes_list$length <- genes_list$X5 - genes_list$X4
+
+## Contains the gene name and gene length
+gene_length_df <- genes_list %>% select('Name', 'length')
+```
+
+## Format GeneInfo File
+
+```{r format geneinfo}
+geneinfo$gene <- stringr::str_replace_all(geneinfo$gene, "Gene:", "")
+## Add in mitochondrial genes to gene info
+geneinfo <- add_mitochondrial_genes(df = geneinfo, column_name = "gene")
+
+## Fix NA Values
+geneinfo$interpro_description[which(is.na(geneinfo$interpro_description))] <- "No InterPro entry"
+geneinfo$go_biologicalprocess[which(is.na(geneinfo$go_biologicalprocess))] <- "No GO terms for biological process"
+geneinfo$go_cellularcomponent[which(is.na(geneinfo$go_cellularcomponent))] <- "No GO terms for cellular component"
+geneinfo$go_molecularfunction[which(is.na(geneinfo$go_molecularfunction))] <- "No GO terms for molecular function"
+```
+
+## Format Tidy Counts File into Counts Matrix
+
+```{r format counts file}
+## rRNAs overlapping with genes
+genes_overlapping_with_rRNAs <- c("WBGene00228061", "WBGene00268654", "WBGene00268655", "WBGene00268656", "WBGene00268657", "WBGene00221211",
+ "WBGene00220288", "WBGene00220284", "WBGene00268299", "WBGene00228060", "WBGene00268300")
+colnames(counts.orig) <- c("Name", "counts", "replicate", "Project")
+counts.orig$counts <- as.double(counts.orig$counts)
+```
+
+```{r}
+## Remove Gene: prefix from gene names
+counts.orig$Name <- stringr::str_replace_all(counts.orig$Name, "Gene:", "")
+counts.orig <- counts.orig %>% dplyr::arrange(replicate, Name)
+## Remove __* lines generated from HTSeq-Counts
+counts.orig <- counts.orig[!grepl("__", counts.orig$Name),]
+## Remove misannotated mRNAs
+counts.orig <- counts.orig[!(counts.orig$Name %in% genes_overlapping_with_rRNAs),]
+## Remove all counts mapping to Wolbachia
+counts.orig <- counts.orig[!(grepl("Wbm", counts.orig$Name)),] ## Remove Wolbachia counts
+
+counts.orig <- dplyr::inner_join(counts.orig, gene_length_df, by = "Name") %>% arrange(replicate, Name)
+```
+
+## Convert counts data frame to counts matrix (row = gene, columns = replicate, values are counts)
+
+```{r}
+counts <- create_matrix(df = counts.orig, row = "Name", centre = "counts", column = "replicate")
+```
+
+## Select Only Genes Annotated in GFF3 File as mRNA
+
+```{r select annotated mRNAs}
+## Select genes annotated as mRNA in GFF3 FIle
+mRNA_features <- annotations %>% filter(X3 == "mRNA")
+## Format names to isolate gene name
+mRNA_features$X9 <- str_remove(mRNA_features$X9, "Parent=Gene:")
+mRNA_features$Name <- gsub(".*:", "", mRNA_features$Name)
+mRNA_features <- unique(mRNA_features$X9)
+
+## Remove the mitochondrial genes from couints
+counts.mito <- counts[grepl("gene-", rownames(counts)),]
+## Select only genes in mRNAs list
+counts.WB.mRNA <- counts[(rownames(counts) %in% mRNA_features),]
+## Combine mRNA gene counts with mitochondrial gene counts
+counts <- rbind(counts.mito, counts.WB.mRNA)
+
+
+```
+
+## Convert Counts Matrix into TPM
+
+```{r convert to tpm}
+## Make sure that the tidy counts dataframe has the same genes as the counts matrix
+counts.orig <- counts.orig[(counts.orig$Name %in% rownames(counts)),] 
+
+if(all(rownames(counts) == unique(counts.orig$Name))){ ## Makes sure the genes are in the same order for the correct division
+
+  tpm <- calculate_TPM(counts.mat = counts, counts.orig = counts.orig)
+
+}else{
+  message('The genes are not in the same order')
+}
+
+counts <- counts[,levels(groups$Replicate)]
+tpm <- tpm[,levels(groups$Replicate)]
+
+```
+
+```{r}
+rarefy.counts <- round(counts,0)
+raremax <- round(min(rowSums(t(rarefy.counts))),0)
+srare <- vegan::rarefy(t(rarefy.counts),raremax)
+rarefy.raw.df <- vegan::rarecurve(t(rarefy.counts), step = round(raremax/10,0), sample = raremax, tidy = T)
+rarefy.raw.df <- rarefy.raw.df %>% group_by(Site)
+
+rarefy.df <- as.data.frame(matrix(nrow = 0,
+                                  ncol = 5))
+rarefy.points.df <- rarefy.df
+for(i in unique(rarefy.raw.df$Site)){
+  steps <- as.numeric(rarefy.raw.df[rarefy.raw.df$Site == i,]$Sample)
+  detected_genes <- as.numeric(rarefy.raw.df[rarefy.raw.df$Site == i,]$Species)
+  
+  rarefy.df <- as.data.frame(rbind(rarefy.df,
+                                   cbind(as.numeric(steps),as.numeric(detected_genes),
+                                         as.character(groups[groups$Replicate == i,]$Replicate),
+                                         as.character(groups[groups$Replicate == i,]$Sample),
+                                         as.character(groups[groups$Replicate == i,]$SampleColour))))
+  
+  rarefy.points.df <- as.data.frame(rbind(rarefy.points.df,
+                                          cbind(as.numeric(max(steps)),as.numeric(max(detected_genes)),
+                                                as.character(groups[groups$Replicate == i,]$Replicate),
+                                                as.character(groups[groups$Replicate == i,]$Sample),
+                                                as.character(groups[groups$Replicate == i,]$SampleColour))))
+  
+  
+}
+
+col <- as.character(groups$SampleColour)
+names(col) <- as.character(groups$Sample)
+
+pdf(paste0(FIGURE_DIR, "/rarefaction_curve.pdf"),
+    width = 10,
+    height = 10)
+  print(
+  ggplot()+
+  geom_line(mapping=aes(x = as.numeric(as.character(rarefy.df$V1)), 
+                        y = as.numeric(as.character(rarefy.df$V2)),
+                        group = rarefy.df$V3,color = rarefy.df$V4), linewidth = 2) +
+  geom_point(mapping=aes(x = as.numeric(as.character(rarefy.points.df$V1)), 
+                         y = as.numeric(as.character(rarefy.points.df$V2)),
+                         group = rarefy.points.df$V3, color = rarefy.points.df$V4),size = 7) +
+  scale_color_manual(values = col)+
+  labs(x="number of reads mapping to features annotated as mRNA", y="number genes detected", color = 'Sample') +
+  theme_bw() + scale_y_continuous(expand = expansion(mult = c(0.2, .2))) + geom_hline(yintercept = nrow(counts))
+  
+
+  )
+
+dev.off()
+```
+
+
+```{r}
+form <- ~ (1|Sample)
+varPart.df.all <- variance_function(counts, groups, form)
+residual_genes <- varPart.df.all %>% filter(attribute == "Residuals" & Variance_Explained == 1) %>% select('gene')
+
+pdf(paste0(FIGURE_DIR, "/all_samples_variancePartition_histogram.pdf"),
+     width = 10,
+     height = 10)
+print(
+ ggplot(varPart.df.all, aes(x = Variance_Explained)) + geom_histogram() + facet_wrap(~attribute, ncol = 1) + 
+   labs(x = 'Variance explained ', title = 'Quek et al 2022 Tetracycline')
+)
+dev.off()
+
+pdf(paste0(FIGURE_DIR, "/all_samples_variancePartition.pdf"),
+     width = 10,
+     height = 10)
+print(
+  ggplot(varPart.df.all, aes(x = attribute, y = Variance_Explained * 100)) + 
+  geom_boxplot() + labs(y = 'Variance explained (%)', title = 'Quek et al 2022 Tetracycline')
+)
+dev.off()
+```
+
+
+# Calculate Differentially Expressed Genes
+```{r calculate differentially expressed genes}
+## Calculate Differential Expression 1423 DE Genes
+FDRcutoff <- 0.05
+cpm.cutoff <- 5/min(colSums(counts)) * 1000000 ## list minimum counts per million
+print(paste0(nrow(counts)," total genes"))
+y <- edgeR::DGEList(counts = counts, group = groups$Sample)
+y <- edgeR::calcNormFactors(y)
+keep <- rowSums(cpm(y) >= cpm.cutoff) >= min(table(groups$Sample)) ## is the cpm > than cutoff in two or more replicates
+keep.df <- as.data.frame(table(keep))
+print(paste0(keep.df[keep.df[,1] == F,2]," genes excluded using edgeR filter"))
+y <- y[keep, , keep.lib.sizes = F] ## Selects genes in y that are in keep
+design <- model.matrix(~groups$Sample)
+y <- estimateDisp(y , design)
+## Next two steps use Genewise negative binomial generalised linear models with quasilikelihood tests
+fit <- edgeR::glmQLFit(y, design) 
+qlf <- edgeR::glmQLFTest(fit, coef = 2:ncol(fit)) 
+FDR <- as.data.frame(p.adjust(qlf$table$PValue, method="BH")) ## Takes pvalue from above and correct using FDR method
+rownames(FDR) <- rownames(qlf$table)
+colnames(FDR) <- "FDR"
+degenes <- rownames(FDR[FDR[,1] < FDRcutoff, , drop = F]) ## Select genes with FDR less than FDR cutoff
+print(paste0(length(degenes)," DE genes"))
+
+tpm.de <- tpm[rownames(tpm) %in% degenes,]
+
+```
+
+## Volcano plot
+```{r}
+qlf$table$FDR <- p.adjust(qlf$table$PValue, method="BH")
+FDR_max = 0.05
+logFC_minimum = 1
+
+qlf$table <- qlf$table %>% mutate(significance = ifelse(abs(logFC) >= logFC_minimum & FDR < FDR_max, "significant", "n.s."))
+nrow(qlf$table %>% filter(significance == "significant"))
+
+pdf(paste0(FIGURE_DIR, "/Volcano_plot.pdf"))
+  print(
+  ggplot(qlf$table, aes(x = logFC, y = -log10(FDR), color = significance)) + geom_point() + 
+    xlim(-5,5) +
+    ylim(0,8) +
+    geom_hline(yintercept = -log10(FDR_max), color = "green", linetype = "dashed") + 
+    geom_vline(xintercept = c(-logFC_minimum,logFC_minimum), color = "blue", linetype = "dashed") +
+    scale_color_manual(breaks = c("significant", "n.s."), 
+                       values = c("red", "grey")) + 
+    theme_bw() + ggtitle("Control vs 6 Week Treated")
+  )
+dev.off()
+```
+
+
+```{r}
+pca <- PCA(t(as.data.frame(t(scale(t(log2(tpm.de+1)))))), graph = FALSE, ncp = ncol(counts) - 1)
+
+pdf(paste0(FIGURE_DIR, "/PCA_of_samples.pdf"))
+  print(
+    ggplot()+
+      geom_point(aes(x=pca$ind$coord[,1], y=pca$ind$coord[,2], color = groups$Sample), size = 10)+
+      labs(col = "Samples", size = "Reads Mapped\nto Features", 
+           x = paste0("PC1 (", round(pca$eig[1,2],1), "%)"), 
+           y = paste0("PC2 (", round(pca$eig[2,2],1), "%)"))+
+      guides(colour = guide_legend(ncol = 2), size = 'none')+
+      scale_color_manual(values = levels(groups$SampleColour))+
+      theme_bw()
+  )
+dev.off()
+```
+
+```{r}
+tpm_dendrogram <- pvclust::pvclust(as.data.frame(t(scale(t(log2(tpm.de+1))))), method.dist="cor", method.hclust="average",
+                                   nboot=1000, parallel=TRUE)
+
+pdf(paste0(FIGURE_DIR, "/dendrogram_tpm_de.pdf"),
+    width = 20,
+    height = 10)
+  plot(tpm_dendrogram)
+invisible(dev.off())
+
+dendro.data <- ggdendro::dendro_data(tpm_dendrogram$hclust)
+dendro_order <- dendro.data$labels %>% select('label')
+
+sample_order <- factor(as.character(dendro_order$label), levels = as.character(dendro_order$label))
+
+groups <- factor_groups(groups[order(match(groups$Replicate, as.character(sample_order))),])
+
+rownames(groups) <- NULL
+
+counts <- counts[,levels(groups$Replicate)]
+tpm <- tpm[,levels(groups$Replicate)]
+
+```
+
+
+```{r}
+wgcna <- as.data.frame(t(tpm.de))
+powers <- c(c(1:10), seq(from = 12, to=20, by=2))
+sft <- pickSoftThreshold(wgcna, powerVector = powers, verbose = 5)
+softpower <- find_soft_power(sft)
+
+adjacency <- adjacency(wgcna, power = softpower)
+TOM <- TOMsimilarity(adjacency)
+dissTOM <- 1-TOM
+geneTree <- hclust(as.dist(dissTOM), method = "average");
+minModuleSize <- 1
+dynamicMods <- cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                             deepSplit = 2, pamRespectsDendro = FALSE,
+                             minClusterSize = minModuleSize)
+dynamicColors = labels2colors(dynamicMods)
+MEList = moduleEigengenes(wgcna, colors = dynamicColors)
+MEs = MEList$eigengenes
+MEDiss = 1-cor(MEs, use = "pairwise.complete.obs")
+METree = hclust(as.dist(MEDiss), method = "average")
+MEDissThres = 0.25
+
+
+merge = mergeCloseModules(wgcna, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+mergedColors = merge$colors
+mergedMEs = merge$newMEs
+
+tpm.de.wgcna <- eigengene_invert_id(tpm.de, mergedColors, mergedMEs)
+tpm.de.wgcna <- wgcna_heatmap_reorder(tpm.de.wgcna)
+
+log2tpm.de <- log2(tpm.de.wgcna[,1:(ncol(tpm.de.wgcna) - 2)] + 1)
+zscore.log2tpm.de <- as.data.frame(t(scale(t(log2tpm.de))))
+
+##-----------------------------------------------------------------------------------------------------------
+## Add invert and module column to the zscore dataframe
+##-----------------------------------------------------------------------------------------------------------
+
+zscore.log2tpm.de <- inner_join(zscore.log2tpm.de %>% rownames_to_column('gene'), 
+           tpm.de.wgcna %>% select('invert', 'module') %>% rownames_to_column('gene'), by = 'gene') %>% column_to_rownames('gene')
+log2tpm.de <- inner_join(log2tpm.de %>% rownames_to_column('gene'), 
+           tpm.de.wgcna %>% select('invert', 'module') %>% rownames_to_column('gene'), by = 'gene') %>% column_to_rownames('gene')
+
+
+hmcol <- colorRampPalette(c("navyblue","white","firebrick3"))(12)
+rowcol <- tpm.de.wgcna$module
+colcol <- as.character(groups$SampleColour)
+rowsep <- get_heatmap_separators(rowcol)
+colsep <- get_heatmap_separators(colcol)
+breaks <- seq(-3,3,by=.5)
+
+rowcol1 <- zscore.log2tpm.de$invert
+rowcol1[rowcol1 == F] <- "grey" ## matching pattern
+rowcol1[rowcol1 == T] <- "black" ## inverted pattern
+
+rowcol2 <- t(cbind(rowcol, rowcol1))
+
+
+##-----------------------------------------------------------------------------------------------------------
+## Set the row colours and coloumn colours as matrices
+##-----------------------------------------------------------------------------------------------------------
+
+rowcol2 <- as.matrix((rowcol2))
+colcol <- as.matrix(colcol)
+
+heatmap_matrix <- as.matrix(zscore.log2tpm.de[,(1:(ncol(zscore.log2tpm.de)-2))])
+heatmap_matrix <- heatmap_matrix[,as.character(sample_order)]
+
+
+pdf(paste0(FIGURE_DIR, "/Figure_3.pdf"),
+    width = 10,
+    height = 10)
+heatmap.3(heatmap_matrix,
+              col=hmcol,
+              trace="none",
+              labRow = NA,
+              labCol = F,
+              Rowv = F,
+              Colv = F,
+              RowSideColors=rowcol2,
+              RowSideColorsSize = 1.5,
+              ColSideColors=t(t(colcol)),
+              lhei = c(2,8,1),
+              breaks = breaks,
+              rowsep = rowsep,
+              colsep = colsep,
+              density.info = 'histogram',
+              dendrogram = "none")
+
+invisible(dev.off())
+
+```
+
+
+## Functional Enrichment
+```{r}
+#### Functional term enrichment
+terms.colnames <- c("term","clusteroccurences","genomeoccurences","pvalue","correctedpvalue","oddsratio","clusterProportion",
+                    "clusterSize", "genomeProportion", "genomeSize", "newOddsRatio" ,"module","invert")
+terms.wgcna <- as.data.frame(matrix(nrow = 0,
+                                    ncol = length(terms.colnames)))
+colnames(terms.wgcna) <- terms.colnames
+
+functionalterms.list <- consolidate_functional_terms(geneinfo)
+
+for(i in 1:length(unique(tpm.de.wgcna$module))){
+  ## First part selects the genes that match the invert value and module ID which becomes the gene list for the functionalenrichment function, then paste in gene info to get the gene descriptions.
+  terms.wgcna.f <- as.data.frame(cbind(functionaltermenrichment(rownames(zscore.log2tpm.de)[zscore.log2tpm.de$module == unique(zscore.log2tpm.de$module)[i] & zscore.log2tpm.de$invert == F],geneinfo, functionalterms.list),
+                                       unique(zscore.log2tpm.de$module)[i],F))
+  terms.wgcna.t <- as.data.frame(cbind(functionaltermenrichment(rownames(zscore.log2tpm.de)[zscore.log2tpm.de$module == unique(zscore.log2tpm.de$module)[i] & zscore.log2tpm.de$invert == T],geneinfo, functionalterms.list),
+                                       unique(zscore.log2tpm.de$module)[i],T))
+  
+  colnames(terms.wgcna.f) <- terms.colnames
+  colnames(terms.wgcna.t) <- terms.colnames
+  terms.wgcna <- as.data.frame(rbind(terms.wgcna,
+                                     terms.wgcna.f, 
+                                     terms.wgcna.t))
+}
+
+pvalue.cutoff <- 0.05
+terms.wgcna.sig <- terms.wgcna[as.numeric(as.character(terms.wgcna$correctedpvalue)) < pvalue.cutoff,]
+print(paste0(nrow(terms.wgcna.sig)," significantly over-/under-represented terms in WGCNA modules"))
+
+
+```
+
+
+
+## Number of genes in each cluster
+```{r}
+table_of_gene_number_in_heatmap <- tibble('Type_of_Comparison' = as.character() ,
+                                          'Number_of_Genes_in_Heatmap' = as.numeric())
+
+for(cluster in unique(tpm.de.wgcna$module)){
+  for(invert_type in unique(tpm.de.wgcna$invert)){
+      table_of_gene_number_in_heatmap <- table_of_gene_number_in_heatmap %>% 
+        add_row(Type_of_Comparison = paste0(cluster, "_", invert_type),
+          Number_of_Genes_in_Heatmap = nrow(tpm.de.wgcna %>% filter(module == cluster & invert == invert_type)))
+  }
+}
+```
+
+
+
+```{r}
+write.table(terms.wgcna,
+            paste0(FILE_DIR,"/functionaltermenrichment_wgcna.tsv"), 
+            row.names = F,
+            col.names = T,
+            quote = F,
+            sep = "\t")
+
+
+## All significantly enriched terms with an odds ratio >= 1
+write.table(terms.wgcna.sig %>% filter(oddsratio >= 1) ,
+            paste0(FILE_DIR,"/functionaltermenrichment_sig_wgcna_overrep.tsv"), 
+            row.names = F,
+            col.names = T,
+            quote = F,
+            sep = "\t")
+
+## All significantly enriched terms with an odds ratio < 1
+write.table(terms.wgcna.sig %>% filter(oddsratio < 1) ,
+            paste0(FILE_DIR,"/functionaltermenrichment_sig_wgcna_underrep.tsv"), 
+            row.names = F,
+            col.names = T,
+            quote = F,
+            sep = "\t")
+
+
+write.table(table_of_gene_number_in_heatmap ,
+            paste0(FILE_DIR,"/table_of_heatmap.tsv"), 
+            row.names = F,
+            col.names = T,
+            quote = F,
+            sep = "\t")
+```
+
+## Supplementary Table 4
+```{r}
+write.table(tpm.de.wgcna %>% rownames_to_column('gene'),
+            paste0(FILE_DIR,"/Supplementary_Table_4.tsv"), 
+            row.names = F,
+            col.names = T,
+            quote = F,
+            sep = "\t")
+
+
+```
+
+
+

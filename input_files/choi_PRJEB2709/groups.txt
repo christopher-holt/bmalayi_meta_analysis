@@ -1,0 +1,14 @@
+ERR048961,adult.male_a,red,PRJEB2709
+ERR048962,adult.female_a,blue,PRJEB2709
+ERR048963,L4_a,yellow,PRJEB2709
+ERR048964,L3_a,green,PRJEB2709
+ERR048965,microfilariae_a,purple,PRJEB2709
+ERR048966,immature.microfilaria_a,orange,PRJEB2709
+ERR048967,eggs.and.embryos_a,grey,PRJEB2709
+ERR048968,immature.microfilaria_b,orange,PRJEB2709
+ERR048969,eggs.and.embryos_b,grey,PRJEB2709
+ERR048970,adult.female_b,blue,PRJEB2709
+ERR048971,L4_b,yellow,PRJEB2709
+ERR048972,adult.female_c,blue,PRJEB2709
+ERR048973,L4_c,yellow,PRJEB2709
+ERR048974,L3_b,green,PRJEB2709
