@@ -1,6 +1,8 @@
 # *Brugia malayi*  Meta-Analysis
 An in-depth analysis of available *B. malayi* RNA-Sequencing data. The files groups.txt and end_type_and_strandness.txt for each project are available in input_files
 
+[![DOI](https://zenodo.org/badge/745300546.svg)](https://zenodo.org/doi/10.5281/zenodo.13694246)
+
 ## Table of Contents
 * [List of Projects and Papers](https://github.com/christopher-holt/bmalayi_meta_analysis?tab=readme-ov-file#list-of-projects-and-papers)
 * [Download Reads](https://github.com/christopher-holt/bmalayi_meta_analysis?tab=readme-ov-file#download-reads)
